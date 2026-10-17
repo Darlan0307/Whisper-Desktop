@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Ambiente e segredos
+.env
+.env.*
+
+# Saída da transcrição pela linha de comando
+audios/
+transcricao*.txt
+
+# Logs
+*.log
+*.log.old
+
+# IDE / editores
+.vscode/
+.idea/
+*.swp
+.claude/settings.local.json
+
+# Sistema
+Thumbs.db
+desktop.ini
+.DS_Store

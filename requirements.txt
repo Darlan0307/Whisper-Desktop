@@ -1,0 +1,14 @@
+# Instalar (sem administrador):  python -m pip install --user -r requirements.txt
+# Versões testadas no Windows 11 com Python 3.12.
+faster-whisper==1.2.1
+ctranslate2==4.8.3
+av<16              # testado com 15.1.0; a 16+ quebra o faster-whisper ("metadata_errors")
+numpy==2.3.5
+huggingface_hub==0.36.2
+tokenizers==0.22.2
+onnxruntime==1.24.1
+sounddevice==0.5.6
+tkinterdnd2==0.6.4
+sv-ttk==2.6.1
+pystray==0.19.5    # ícone perto do relógio
+Pillow==12.3.0     # usado pelo pystray para o ícone
