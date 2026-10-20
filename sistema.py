@@ -4,6 +4,8 @@ Integração com o Windows (via ctypes, sem dependências extras):
   • AtalhoGlobal: Ctrl+Shift+Espaço funcionando em qualquer programa. Usa
     RegisterHotKey: o Windows só avisa o app quando ESSA combinação é apertada;
     nenhuma outra tecla é lida ou registrada. A thread fica dormindo (0% de CPU).
+  • Esc segurado: só DURANTE uma gravação o app consulta se o Esc está apertado
+    (para descartar o ditado). Não intercepta a tecla: o outro programa recebe o Esc.
   • Colagem no programa ativo (simula Ctrl+V), instância única.
   • Bandeja: ícone perto do relógio (pystray).
 """
@@ -40,8 +42,8 @@ kernel32.CloseHandle.argtypes = [wt.HANDLE]
 
 WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
 MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x0002, 0x0004, 0x4000
-VK_SPACE, VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_V = (
-    0x20, 0x10, 0x11, 0x12, 0x5B, 0x5C, 0x56)
+VK_SPACE, VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_V, VK_ESCAPE = (
+    0x20, 0x10, 0x11, 0x12, 0x5B, 0x5C, 0x56, 0x1B)
 KEYEVENTF_KEYUP = 0x0002
 
 
@@ -110,6 +112,10 @@ def teclas_de_atalho_soltas() -> bool:
     simulado não virar Ctrl+Shift+V)."""
     return not any(user32.GetAsyncKeyState(vk) & 0x8000
                    for vk in (VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_SPACE))
+
+
+def esc_apertado() -> bool:
+    return bool(user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000)
 
 
 def simular_ctrl_v():

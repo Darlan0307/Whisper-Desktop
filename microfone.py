@@ -130,6 +130,33 @@ def _reamostrar(audio: np.ndarray, taxa_orig: int) -> np.ndarray:
     return np.interp(x_saida, np.arange(audio.size), audio).astype(np.float32)
 
 
+def _ponto_de_corte(audio: np.ndarray, taxa: int, minimo_s, maximo_s, pausa_s):
+    """Amostra onde cortar o áudio: no meio da 1ª pausa de fala (pelo menos pausa_s
+    de silêncio) depois de minimo_s. Sem pausa e já com maximo_s, corta no momento
+    mais silencioso dos últimos segundos. Senão, None (espera mais áudio)."""
+    quadro = int(taxa * 0.03)  # quadros de 30 ms
+    n = audio.size // quadro
+    if n < 2:
+        return None
+    rms = np.sqrt(np.mean(audio[:n * quadro].reshape(n, quadro) ** 2, axis=1))
+    # "Silêncio" é relativo ao próprio microfone: perto do ruído de fundo, longe da voz.
+    piso, voz = np.percentile(rms, 10), np.percentile(rms, 90)
+    quieto = rms < piso + (voz - piso) * 0.15
+    precisa = max(1, round(pausa_s / 0.03))
+    inicio = round(minimo_s / 0.03)
+    seguidos = 0
+    for i in range(n):
+        seguidos = seguidos + 1 if quieto[i] else 0
+        if seguidos >= precisa and i >= inicio:
+            return (i - seguidos // 2) * quadro
+    if audio.size < maximo_s * taxa:
+        return None
+    janela = max(1, round(0.3 / 0.03))
+    media = np.convolve(rms, np.ones(janela) / janela, mode="same")
+    de = max(inicio, n - round(10 / 0.03))
+    return (de + int(np.argmin(media[de:]))) * quadro
+
+
 class Gravador:
     """Grava do microfone para a memória. Uso: iniciar(indice) ... parar() -> array."""
 
@@ -195,6 +222,22 @@ class Gravador:
         # nível em escala "visual" (raiz do RMS deixa a voz baixa mais visível)
         rms = float(np.sqrt(np.mean(mono * mono))) if mono.size else 0.0
         self.nivel = min(1.0, (rms * 4) ** 0.5)
+
+    def retirar_trecho(self, minimo_s=15.0, maximo_s=28.0, pausa_s=0.6):
+        """Para transcrever enquanto a pessoa fala: com pelo menos minimo_s gravados,
+        corta numa pausa e devolve esse começo (16 kHz mono); o resto continua na
+        gravação. Retorna None se ainda não é hora de cortar."""
+        with self._trava:
+            n_blocos = len(self._blocos)
+            if sum(b.size for b in self._blocos) < minimo_s * self._taxa:
+                return None
+            audio = np.concatenate(self._blocos)
+        corte = _ponto_de_corte(audio, self._taxa, minimo_s, maximo_s, pausa_s)
+        if corte is None:
+            return None
+        with self._trava:  # blocos que chegaram durante o cálculo ficam depois do resto
+            self._blocos = [audio[corte:]] + self._blocos[n_blocos:]
+        return _reamostrar(audio[:corte], self._taxa)
 
     def parar(self) -> np.ndarray:
         """Para a gravação e devolve o áudio em 16 kHz mono float32."""

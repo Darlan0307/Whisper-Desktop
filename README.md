@@ -10,13 +10,16 @@ Este app faz a transcrição na própria máquina com o [faster-whisper](https:/
 
 ## Funcionalidades
 
-- **Ditar pelo microfone**: grava na memória (não cria arquivo) e transcreve ao parar. Botão, F9 ou Ctrl+Shift+Espaço.
-- **Ditado em qualquer programa**: com Ctrl+Shift+Espaço o app grava mesmo minimizado, mostra um aviso discreto no rodapé da tela e cola o texto na janela que estava ativa. Se você trocou de janela no meio, ele só copia, para não colar no lugar errado.
+- **Ditar pelo microfone**: grava na memória (não cria arquivo). Botão, F9 ou Ctrl+Shift+Espaço. Segurar Esc descarta o ditado sem transcrever.
+- **Transcreve enquanto você fala**: a gravação é cortada nas pausas a cada ~15 s e cada trecho já vai sendo transcrito. Ao parar, só falta o último pedaço: num ditado de 2 minutos, o texto fica pronto em 1 a 2 s na GPU.
+- **Ditado em qualquer programa**: com Ctrl+Shift+Espaço o app grava mesmo minimizado, mostra um aviso discreto no rodapé da tela e cola o texto na janela onde você **parou** o ditado (pode trocar de tela no meio). Se a janela mudou enquanto transcrevia, ele só copia, para não colar no lugar errado. Um som curto avisa quando terminou (dá para desligar).
+- **Vocabulário de dev**: o ditado já vem com uma dica de termos técnicos (deploy, commit, pull request, Supabase, Vercel...), então eles saem escritos do jeito certo.
+- **GPU NVIDIA**: usa a placa de vídeo quando disponível (cerca de 5x mais rápido) e volta sozinho para o processador se ela faltar ou falhar. No processador, usa só metade dos núcleos e prioridade baixa, para não travar os outros programas.
 - **Áudios do WhatsApp em lote**: arraste vários `.ogg`/`.opus`/`.mp3`/`.m4a`/`.wav`/`.aac`/`.flac`, ajuste a ordem e transcreva. A saída sai no formato `Áudio 1: ... Áudio 2: ...`, com botão para copiar cada um ou tudo, e opção de salvar em `.txt`.
 - **Histórico local**: as transcrições ficam num SQLite em `%APPDATA%\TranscricaoAudio`, com busca que ignora acentos, filtro por tipo e apagamento automático após 7, 30 ou 90 dias. Pode ser desligado.
 - **Fica na bandeja**: fechar a janela deixa o app perto do relógio. Depois de um tempo sem uso o modelo sai da memória e volta sozinho na próxima transcrição.
 - **Tema claro/escuro** no visual do Windows 11, acompanhando o sistema ou fixo.
-- **Escolha do modelo** (`tiny` a `large-v3`) direto na barra de status.
+- **Escolha do modelo** (`tiny` a `large-v3`) e de GPU/CPU direto na barra de status.
 - **Versão de linha de comando** para transcrever uma pasta inteira de uma vez.
 
 ## Screenshots
@@ -47,6 +50,7 @@ Aviso flutuante durante o ditado pelo atalho global:
 - **Windows 10 ou 11.** O atalho global, a bandeja e a colagem automática usam APIs do Windows.
 - **Python 3.12** do [python.org](https://www.python.org/downloads/), com o Tcl/Tk que vem no instalador padrão.
 - Uns 2 GB de RAM livres para o modelo `small` (o padrão).
+- Opcional: placa de vídeo NVIDIA (testado numa RTX 2050 de 4 GB). O `medium` ocupa ~1,1 GB de memória de vídeo.
 - Internet só na primeira execução, para baixar o modelo (cerca de 500 MB no `small`). Depois funciona offline.
 
 ## Instalação
@@ -60,6 +64,14 @@ python -m venv .venv
 ```
 
 As versões no `requirements.txt` estão fixadas de propósito: a `av` 16 ou mais nova quebra o faster-whisper.
+
+Para usar a GPU NVIDIA (opcional, ~500 MB):
+
+```powershell
+.venv\Scripts\python -m pip install -r requirements-gpu.txt
+```
+
+Sem isso o app funciona normalmente no processador. A barra de status mostra onde o modelo está rodando ("Pronto (modelo medium, GPU)").
 
 ## Como usar
 
@@ -101,9 +113,10 @@ Não há variáveis de ambiente nem arquivo `.env`. Tudo que o app guarda fica e
 
 | Arquivo | Conteúdo |
 |---|---|
-| `config.json` | microfone, modelo, tema, opções de copiar/colar, tamanho da janela |
+| `config.json` | microfone, modelo, GPU/CPU, tema, som, opções de copiar/colar, tamanho da janela |
 | `historico.db` | histórico das transcrições |
 | `app.log` | log de erros (rotaciona em ~2 MB) |
+| `sons\` | os sons de aviso, gerados na primeira execução |
 
 Para começar do zero, feche o app e apague essa pasta.
 
@@ -114,7 +127,8 @@ app.pyw                    interface (abas Ditar, Áudios do WhatsApp e Históri
 transcricao.py             fila de transcrição e carregamento do modelo, sem interface
 microfone.py               lista os microfones e grava em 16 kHz mono na memória
 historico.py               histórico em SQLite
-sistema.py                 integração com o Windows: atalho global, colar, bandeja
+sistema.py                 integração com o Windows: atalho global, colar, bandeja, Esc
+sons.py                    sons de aviso do ditado, gerados com numpy
 icones.py                  ícones desenhados com numpy, recoloridos conforme o tema
 instalar_atalho.py         gera icone.ico e os atalhos do Menu Iniciar/Área de Trabalho
 instalar_inicializacao.py  atalho na pasta de inicialização do Windows
@@ -137,7 +151,6 @@ python -m ruff check .
 - Testes automatizados para `transcricao.py` e `historico.py`
 - Executável empacotado (PyInstaller) para quem não tem Python
 - Escolha de idioma (hoje é fixo em português)
-- Suporte a GPU (CUDA) para os modelos maiores
 
 ## Licença
 

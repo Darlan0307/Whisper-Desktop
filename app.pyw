@@ -62,6 +62,7 @@ import numpy as np
 import historico
 import icones
 import microfone
+import sons
 import transcricao
 
 try:
@@ -95,7 +96,10 @@ if sys.platform == "win32":
         pass
 
 TEMAS = {"Automático": "auto", "Claro": "claro", "Escuro": "escuro"}
-LIMITE_GRAVACAO_MIN = 15  # ~170 MB de memória no pior caso (microfone a 48 kHz)
+DISPOSITIVOS = {"GPU": "gpu", "CPU": "cpu"}
+LIMITE_GRAVACAO_MIN = 15  # proteção contra uma gravação esquecida ligada
+ESC_SEGURAR_S = 0.8  # segurar Esc por esse tempo descarta o ditado em andamento
+DICA_GRAVAR = "Clique no botão vermelho ou aperte F9 para gravar"
 LIBERAR_MODELO_APOS_S = 120  # janela escondida + sem uso por 2 min = tira o modelo da RAM
 LIBERAR_MODELO_JANELA_ABERTA_S = 600  # janela aberta + sem uso por 10 min = idem
 RETENCAO = {"Nunca apagar": 0, "Apagar após 7 dias": 7, "Apagar após 30 dias": 30,
@@ -136,7 +140,8 @@ def windows_em_modo_escuro() -> bool:
 def carregar_config() -> dict:
     padrao = {"microfone": None, "modelo": transcricao.MODELO_PADRAO, "tema": "auto",
               "copiar_auto": True, "colar_auto": True, "geometria": None, "pasta_audios": None,
-              "historico": True, "historico_dias": 0, "aviso_bandeja_mostrado": False}
+              "historico": True, "historico_dias": 0, "aviso_bandeja_mostrado": False,
+              "dispositivo": "gpu", "som": True}
     try:
         padrao.update(json.loads(ARQ_CONFIG.read_text(encoding="utf-8")))
     except FileNotFoundError:
@@ -147,6 +152,8 @@ def carregar_config() -> dict:
         padrao["modelo"] = transcricao.MODELO_PADRAO
     if padrao["tema"] not in TEMAS.values():
         padrao["tema"] = "auto"
+    if padrao["dispositivo"] not in DISPOSITIVOS.values():
+        padrao["dispositivo"] = "gpu"
     return padrao
 
 
@@ -331,13 +338,31 @@ class ZonaSoltar(tk.Canvas):
 
 # ---------------------------------------------------------------- aba Ditar
 
+class Ditado:
+    """Uma gravação. Ela é cortada em trechos nas pausas da fala, e cada trecho vai
+    sendo transcrito enquanto você continua falando: ao parar, só falta o último."""
+
+    def __init__(self, origem, alvo=None):
+        self.origem = origem  # "janela" (botão/F9) ou "atalho" (Ctrl+Shift+Espaço)
+        self.alvo = alvo      # janela onde colar o texto (só no atalho)
+        self.textos = []      # um por trecho, na ordem; preenchidos na thread de fundo
+        self.prontos = 0
+        self.erro = None
+        self.gravando = True
+        self.descartado = False
+        self.concluido = False
+
+
 class AbaDitar(ttk.Frame):
     def __init__(self, pai, app):
         super().__init__(pai, padding=(16, 14))
         self.app = app
         self.gravador = microfone.Gravador()
         self.microfones = []
-        self.pendentes = 0  # gravações aguardando transcrição
+        self.ditado = None  # Ditado sendo gravado agora
+        self.pendentes = 0  # ditados já parados, aguardando transcrição
+        self._esc_desde = None
+        self._proximo_corte = 0.0
 
         linha = ttk.Frame(self)
         linha.pack(fill="x")
@@ -358,7 +383,7 @@ class AbaDitar(ttk.Frame):
         topo.pack(fill="x")
         self.lb_tempo = ttk.Label(topo, text="00:00", font=fonte(20, "bold"))
         self.lb_tempo.pack(side="left")
-        self.lb_dica = Rotulo(topo, app, "Clique no botão vermelho ou aperte F9 para gravar")
+        self.lb_dica = Rotulo(topo, app, DICA_GRAVAR)
         self.lb_dica.pack(side="left", padx=12, pady=(6, 0))
         self.onda = Onda(direita, app)
         self.onda.pack(fill="x", pady=(4, 0))
@@ -390,7 +415,13 @@ class AbaDitar(ttk.Frame):
         self.lb_atalho = Rotulo(linha, app)
         self.lb_atalho.pack(side="left", padx=10)
 
-        self.origem = "janela"  # "janela" (botão/F9) ou "atalho" (Ctrl+Shift+Espaço)
+        linha = ttk.Frame(self)
+        linha.pack(fill="x", pady=(8, 0))
+        self.var_som = tk.BooleanVar(value=bool(app.cfg.get("som", True)))
+        ttk.Checkbutton(linha, text="Tocar um som quando o ditado pelo atalho terminar",
+                        style="Switch.TCheckbutton", variable=self.var_som,
+                        command=self._salvar_opcoes).pack(side="left")
+
         self.atualizar_microfones()
 
     # --- microfones
@@ -420,6 +451,7 @@ class AbaDitar(ttk.Frame):
     def _salvar_opcoes(self):
         self.app.cfg["copiar_auto"] = self.var_auto.get()
         self.app.cfg["colar_auto"] = self.var_colar.get()
+        self.app.cfg["som"] = self.var_som.get()
         salvar_config(self.app.cfg)
 
     # --- gravação
@@ -430,7 +462,7 @@ class AbaDitar(ttk.Frame):
         else:
             self.gravar(origem)
 
-    def gravar(self, origem="janela"):
+    def gravar(self, origem="janela", alvo=None):
         pos = self.combo_mic.current()
         if pos < 0 or pos >= len(self.microfones):
             self.atualizar_microfones()  # talvez o microfone tenha sido ligado agora
@@ -445,16 +477,19 @@ class AbaDitar(ttk.Frame):
         except microfone.ErroMicrofone as erro:
             self.app.avisar_erro(origem, "Microfone", str(erro))
             return False
-        self.origem = origem
+        self.ditado = Ditado(origem, alvo)
+        self._esc_desde = None
+        self._proximo_corte = 0.0
         self.app.marcar_uso()
         if self.app.transcritor.estado == "liberado":
-            self.app.transcritor.carregar()  # carrega (~1 s) enquanto você fala
+            self.app.transcritor.carregar()  # carrega enquanto você fala
         self._mic_escolhido()
         self.bt_gravar.definir_gravando(True)
         self.combo_mic.config(state="disabled")
         self.onda.ativo = True
         self.onda.limpar()
-        self.lb_dica.mostrar("Gravando... clique de novo (ou F9) para parar", "erro")
+        self.lb_dica.mostrar("Gravando... clique de novo (ou F9) para parar, "
+                             "segure Esc para descartar", "erro")
         self.app.gravacao_mudou(True, origem)
         self._atualizar_medidor()
         return True
@@ -462,53 +497,91 @@ class AbaDitar(ttk.Frame):
     def _atualizar_medidor(self):
         if not self.gravador.gravando:
             return
+        agora = time.monotonic()
+        if sistema is not None and sistema.esc_apertado():
+            self._esc_desde = self._esc_desde or agora
+            if agora - self._esc_desde >= ESC_SEGURAR_S:
+                self.descartar()
+                return
+        else:
+            self._esc_desde = None
         if self.gravador.duracao >= LIMITE_GRAVACAO_MIN * 60:
-            # Proteção: uma gravação esquecida ligada encheria a memória do PC.
-            origem = self.origem
+            # Proteção: uma gravação esquecida ligada ocuparia o PC à toa.
+            origem = self.ditado.origem
             self.parar()
             self.app.avisar_erro(
                 origem, "Gravação encerrada",
                 f"A gravação foi parada automaticamente ao chegar a {LIMITE_GRAVACAO_MIN} "
-                "minutos, para não ocupar memória demais.\n\nO que foi gravado será transcrito "
-                "normalmente. Se precisar de mais, é só gravar de novo.", tipo="info")
+                "minutos.\n\nO que foi gravado será transcrito normalmente. "
+                "Se precisar de mais, é só gravar de novo.", tipo="info")
             return
+        if agora >= self._proximo_corte:
+            self._proximo_corte = agora + 0.5
+            trecho = self.gravador.retirar_trecho()
+            if trecho is not None:
+                self._enviar_trecho(self.ditado, trecho)
         seg = int(self.gravador.duracao)
         self.lb_tempo.config(text=f"{seg // 60:02d}:{seg % 60:02d}")
         self.onda.adicionar(self.gravador.nivel)
         self.app.aviso.atualizar(seg, self.gravador.nivel)
         self.after(60, self._atualizar_medidor)
 
-    def parar(self):
-        audio = self.gravador.parar()
-        origem = self.origem
+    def _interface_parada(self, ditado):
         self.bt_gravar.definir_gravando(False)
         self.lb_tempo.config(text="00:00")
         self.combo_mic.config(state="readonly")
         self.onda.ativo = False
         self.onda.desenhar()
-        self.lb_dica.mostrar("Clique no botão vermelho ou aperte F9 para gravar")
-        self.app.gravacao_mudou(False, origem)
+        self.lb_dica.mostrar(DICA_GRAVAR)
+        self.app.gravacao_mudou(False, ditado.origem)
         self.app.marcar_uso()
 
+    def parar(self):
+        audio = self.gravador.parar()
+        d, self.ditado = self.ditado, None
+        d.gravando = False
+        self._interface_parada(d)
+
         duracao = audio.size / transcricao.TAXA_AMOSTRAGEM
-        if duracao < 0.5:
-            self.lb_estado.mostrar("Gravação muito curta. Tente de novo.", "erro")
-            self.app.aviso.mostrar_mensagem("Gravação muito curta", "erro")
-            return
-        if not np.any(audio):
-            # zeros absolutos = o Windows entregou silêncio (bloqueio ou mudo)
-            msg = ("O microfone só gravou silêncio absoluto.\n\n"
-                   "Verifique se ele não está no mudo e se a privacidade do Windows "
-                   "permite o acesso.\n\n" + microfone.MSG_PRIVACIDADE)
-            self.lb_estado.mostrar("Nada gravado.", "erro")
-            self.app.avisar_erro(origem, "Microfone sem som", msg)
-            return
+        if not d.textos:  # nenhum trecho foi cortado durante a gravação
+            if duracao < 0.5:
+                self.lb_estado.mostrar("Gravação muito curta. Tente de novo.", "erro")
+                self.app.aviso.mostrar_mensagem("Gravação muito curta", "erro")
+                self.app.som_do_ditado(d.origem, "erro")
+                return
+            if not np.any(audio):
+                # zeros absolutos = o Windows entregou silêncio (bloqueio ou mudo)
+                msg = ("O microfone só gravou silêncio absoluto.\n\n"
+                       "Verifique se ele não está no mudo e se a privacidade do Windows "
+                       "permite o acesso.\n\n" + microfone.MSG_PRIVACIDADE)
+                self.lb_estado.mostrar("Nada gravado.", "erro")
+                self.app.avisar_erro(d.origem, "Microfone sem som", msg)
+                return
+        if duracao >= 0.3:
+            self._enviar_trecho(d, audio)
 
         self.pendentes += 1
         self._mostrar_pendentes()
-        if origem == "atalho":
+        if d.origem == "atalho":
             self.app.aviso.mostrar_mensagem("Transcrevendo...", "info", esconder_ms=0)
-        self.app.transcritor.executar(lambda modelo: self._tarefa(modelo, audio, origem))
+        self._talvez_concluir(d)  # caso todos os trechos já estejam prontos
+
+    def descartar(self):
+        """Para a gravação sem transcrever (Esc segurado). Trechos já na fila são ignorados."""
+        if not self.gravador.gravando:
+            return
+        self.gravador.cancelar()
+        d, self.ditado = self.ditado, None
+        d.gravando = False
+        d.descartado = True
+        self._interface_parada(d)
+        self.lb_estado.mostrar("Ditado descartado.")
+        self.app.aviso.mostrar_mensagem("Ditado descartado", "info", 1500)
+
+    def _enviar_trecho(self, d, audio):
+        i = len(d.textos)
+        d.textos.append("")
+        self.app.transcritor.executar(lambda transcrever: self._tarefa(transcrever, d, i, audio))
 
     def _mostrar_pendentes(self):
         if self.pendentes == 0:
@@ -526,38 +599,62 @@ class AbaDitar(ttk.Frame):
             self.ocupado.pack(side="left", padx=10)
             self.ocupado.start(12)
 
-    def _tarefa(self, modelo, audio, origem):
-        """Roda na thread de fundo."""
-        try:
-            texto = transcricao.transcrever(modelo, audio)
-            erro = None
-        except Exception as e:
-            traceback.print_exc()
-            texto, erro = "", str(e)
-        self.app.na_interface(lambda: self._resultado(texto, erro, origem))
+    def _tarefa(self, transcrever, d, i, audio):
+        """Roda na thread de fundo, um trecho por vez e na ordem."""
+        erro = None
+        if not d.descartado:
+            # O fim do trecho anterior vai junto do vocabulário: dá contexto ao modelo
+            # e mantém o mesmo estilo de escrita de um trecho para o outro.
+            anterior = d.textos[i - 1][-200:] if i else ""
+            prompt = f"{transcricao.VOCABULARIO_DEV} {anterior}".strip()
+            try:
+                d.textos[i] = transcrever(audio, rapido=True, prompt=prompt,
+                                          cancelado=lambda: d.descartado)
+            except transcricao.Cancelado:
+                pass
+            except Exception as e:
+                traceback.print_exc()
+                erro = str(e)
+        self.app.na_interface(lambda: self._trecho_pronto(d, erro))
 
-    def _resultado(self, texto, erro, origem="janela"):
+    def _trecho_pronto(self, d, erro):
+        d.prontos += 1
+        if erro:
+            d.erro = erro
+        self._talvez_concluir(d)
+
+    def _talvez_concluir(self, d):
+        if d.gravando or d.descartado or d.concluido or d.prontos < len(d.textos):
+            return
+        d.concluido = True
+        self._resultado(" ".join(t for t in d.textos if t).strip(), d.erro, d)
+
+    def _resultado(self, texto, erro, d):
         self.pendentes = max(0, self.pendentes - 1)
         self.app.marcar_uso()
-        if erro:
-            self.lb_estado.mostrar(f"Erro ao transcrever: {erro}", "erro")
-            self.app.aviso.mostrar_mensagem("Erro ao transcrever", "erro")
-        elif not texto:
-            self.lb_estado.mostrar("Nenhuma fala reconhecida na gravação.", "erro")
-            self.app.aviso.mostrar_mensagem("Nenhuma fala reconhecida", "erro")
+        if not texto:
+            if erro:
+                self.lb_estado.mostrar(f"Erro ao transcrever: {erro}", "erro")
+                self.app.aviso.mostrar_mensagem("Erro ao transcrever", "erro")
+            else:
+                self.lb_estado.mostrar("Nenhuma fala reconhecida na gravação.", "erro")
+                self.app.aviso.mostrar_mensagem("Nenhuma fala reconhecida", "erro")
+            self.app.som_do_ditado(d.origem, "erro")
         else:
             atual = self.texto.get("1.0", "end-1c")
             separador = "" if not atual or atual.endswith((" ", "\n")) else " "
             self.texto.insert("end", separador + texto)
             self.texto.see("end")
             self.app.salvar_no_historico("Ditado", texto)
-            if origem == "atalho":
-                self.app.entregar_ditado_do_atalho(texto)
+            if d.origem == "atalho":
+                self.app.entregar_ditado_do_atalho(texto, d.alvo)
             elif self.var_auto.get():
                 self.app.copiar_texto(texto)
                 self.lb_estado.mostrar("✓ Pronto! Texto copiado (Ctrl+V para colar).", "ok")
             else:
                 self.lb_estado.mostrar("✓ Pronto!", "ok")
+            if erro:
+                self.lb_estado.mostrar(f"⚠ Parte da gravação não foi transcrita: {erro}", "erro")
         self._mostrar_pendentes()
 
     # --- botões
@@ -795,27 +892,27 @@ class AbaArquivos(ttk.Frame):
             self.lb_estado.mostrar("Aguardando o modelo terminar de carregar...", "info")
         else:
             self.lb_estado.mostrar("Na fila...", "info")
-        self.app.transcritor.executar(lambda modelo: self._tarefa(modelo, itens))
+        self.app.transcritor.executar(lambda transcrever: self._tarefa(transcrever, itens))
 
     def cancelar(self):
         self.cancelar_evento.set()
         self.bt_cancelar.config(state="disabled")
         self.lb_estado.mostrar("Cancelando...", "info")
 
-    def _tarefa(self, modelo, itens):
+    def _tarefa(self, transcrever, itens):
         """Roda na thread de fundo: um arquivo por vez; erro em um não para os outros."""
         ui = self.app.na_interface
         total = len(itens)
         feitos = 0
         try:
-            feitos = self._transcrever_itens(modelo, itens, ui, total)
+            feitos = self._transcrever_itens(transcrever, itens, ui, total)
         finally:
             # Sempre destrava a aba (senão ela ficaria "rodando" para sempre e o
             # modelo nunca sairia da memória).
             cancelado = self.cancelar_evento.is_set()
             ui(lambda: self._fim(feitos, total, cancelado))
 
-    def _transcrever_itens(self, modelo, itens, ui, total):
+    def _transcrever_itens(self, transcrever, itens, ui, total):
         feitos = 0
         for n, (iid, caminho) in enumerate(itens):
             if self.cancelar_evento.is_set():
@@ -829,8 +926,8 @@ class AbaArquivos(ttk.Frame):
                 self.lista.see(iid),
                 self.lb_estado.mostrar(f"Transcrevendo {n + 1} de {total}: {c.name}", "info")))
             try:
-                texto = transcricao.transcrever(modelo, caminho, ao_progredir=progredir,
-                                                cancelado=self.cancelar_evento.is_set)
+                texto = transcrever(caminho, ao_progredir=progredir,
+                                    cancelado=self.cancelar_evento.is_set)
                 texto = texto or "[sem fala detectada]"
                 status, tag = "✓ concluído", "ok"
             except transcricao.Cancelado:
@@ -1152,7 +1249,8 @@ class AvisoFlutuante(tk.Toplevel):
         self.tempo = tk.Label(q, bg=self.FUNDO, fg="#bdbdbd", font=fonte(10))
         self.barras = tk.Canvas(q, width=round(70 * e), height=round(20 * e), bg=self.FUNDO,
                                 highlightthickness=0)
-        self.dica = tk.Label(q, text="Ctrl+Shift+Espaço para parar", bg=self.FUNDO,
+        self.dica = tk.Label(q, text="Ctrl+Shift+Espaço para parar · segure Esc para descartar",
+                             bg=self.FUNDO,
                              fg="#8f8f8f", font=fonte(9))
         self.extras = (self.tempo, self.barras, self.dica)
         self.geometry("+-20000+-20000")
@@ -1259,6 +1357,11 @@ class App:
         except Exception:
             self.historico = None
             traceback.print_exc()
+        try:
+            self.sons = sons.Sons(PASTA_DADOS / "sons")
+        except Exception:
+            self.sons = None
+            traceback.print_exc()
 
         self.raiz = TkinterDnD.Tk() if TEM_DND else tk.Tk()
         self.raiz.withdraw()  # só mostra depois de montar e aplicar o tema
@@ -1300,6 +1403,13 @@ class App:
         self.combo_modelo.bind("<<ComboboxSelected>>", self._trocar_modelo)
         self.combo_modelo.pack(side="right")
         ttk.Label(barra, text="Modelo").pack(side="right", padx=(16, 6))
+        self.combo_dispositivo = ttk.Combobox(barra, state="readonly", width=5,
+                                              values=list(DISPOSITIVOS))
+        self.combo_dispositivo.set(next(k for k, v in DISPOSITIVOS.items()
+                                        if v == self.cfg["dispositivo"]))
+        self.combo_dispositivo.bind("<<ComboboxSelected>>", self._trocar_dispositivo)
+        self.combo_dispositivo.pack(side="right")
+        ttk.Label(barra, text="Usar").pack(side="right", padx=(16, 6))
         self.combo_tema = ttk.Combobox(barra, state="readonly", width=11, values=list(TEMAS))
         self.combo_tema.set(next(k for k, v in TEMAS.items() if v == self.cfg["tema"]))
         self.combo_tema.bind("<<ComboboxSelected>>", self._trocar_tema)
@@ -1324,9 +1434,9 @@ class App:
         self.transcritor = transcricao.Transcritor(
             lambda estado, msg: self.na_interface(lambda: self._status(estado, msg)))
         if minimizado:  # aberto com o Windows: o modelo só carrega quando for usado
-            self.transcritor.adiar(self.cfg["modelo"])
+            self.transcritor.adiar(self.cfg["modelo"], self.cfg["dispositivo"])
         else:
-            self.transcritor.carregar(self.cfg["modelo"])
+            self.transcritor.carregar(self.cfg["modelo"], self.cfg["dispositivo"])
         self._iniciar_integracoes()
         self._processar_fila()
         self.raiz.after(30_000, self._verificar_ocioso)
@@ -1493,14 +1603,22 @@ class App:
             ok = messagebox.askyesno(
                 "Trocar modelo",
                 f"O modelo \"{novo}\" é mais preciso, porém bem mais lento no processador "
-                "e precisa ser baixado da internet na primeira vez (de 1,5 a 3 GB).\n\n"
-                "Deseja continuar?", parent=self.raiz)
+                "(na GPU a diferença é pequena) e precisa ser baixado da internet na primeira "
+                "vez (de 1,5 a 3 GB).\n\nDeseja continuar?", parent=self.raiz)
             if not ok:
                 self.combo_modelo.set(self.cfg["modelo"])
                 return
         self.cfg["modelo"] = novo
         salvar_config(self.cfg)
         self.transcritor.carregar(novo)
+
+    def _trocar_dispositivo(self, _evento=None):
+        novo = DISPOSITIVOS[self.combo_dispositivo.get()]
+        if novo == self.cfg["dispositivo"]:
+            return
+        self.cfg["dispositivo"] = novo
+        salvar_config(self.cfg)
+        self.transcritor.carregar(dispositivo=novo)
 
     # --- utilidades
 
@@ -1573,6 +1691,12 @@ class App:
     def _atalho_apertado(self, pela_bandeja=False):
         d = self.aba_ditar
         if d.gravador.gravando:
+            # O texto vai para a janela onde você PAROU de gravar: no meio do ditado
+            # você pode ter ido para outra tela e voltado (ou mudado de ideia).
+            if not pela_bandeja and d.ditado and d.ditado.origem == "atalho":
+                agora = sistema.janela_ativa()
+                if agora and not sistema.janela_e_deste_app(agora):
+                    d.ditado.alvo = self.alvo_hwnd = agora
             d.parar()
             return
         alvo = None if pela_bandeja else sistema.janela_ativa()
@@ -1581,7 +1705,7 @@ class App:
             d.gravar("janela")
             return
         self.alvo_hwnd = alvo
-        d.gravar("atalho")  # gravar() já recarrega o modelo, se preciso, enquanto você fala
+        d.gravar("atalho", alvo)  # gravar() já recarrega o modelo, se preciso, enquanto você fala
 
     def gravacao_mudou(self, gravando, origem):
         if self.bandeja is not None:
@@ -1589,17 +1713,22 @@ class App:
         if gravando and origem == "atalho":
             self.aviso.mostrar_gravando()
 
-    def entregar_ditado_do_atalho(self, texto):
-        """Cola o texto onde o cursor estava. Só cola se aquela MESMA janela ainda
-        estiver em foco; senão apenas copia (para não colar no lugar errado)."""
+    def som_do_ditado(self, origem, nome):
+        """Som só no ditado pelo atalho: é quando o app está em segundo plano."""
+        if origem == "atalho" and self.sons is not None and self.aba_ditar.var_som.get():
+            self.sons.tocar(nome)
+
+    def entregar_ditado_do_atalho(self, texto, alvo):
+        """Cola o texto na janela onde o ditado foi parado. Só cola se aquela MESMA
+        janela ainda estiver em foco; senão apenas copia (para não colar no lugar errado)."""
         d = self.aba_ditar
-        alvo = self.alvo_hwnd
         pode_colar = (d.var_colar.get() and alvo and sistema.janela_ativa() == alvo
                       and not sistema.janela_e_deste_app(alvo))
         if not pode_colar:
             self.copiar_texto(texto)
             d.lb_estado.mostrar("✓ Pronto! Texto copiado (Ctrl+V para colar).", "ok")
             self.aviso.mostrar_mensagem("Copiado: Ctrl+V para colar", "ok", 2500)
+            self.som_do_ditado("atalho", "copiado")
             return
         anterior = None
         if not d.var_auto.get():  # devolve depois o que você tinha copiado antes
@@ -1620,11 +1749,13 @@ class App:
             sistema.simular_ctrl_v()
             d.lb_estado.mostrar("✓ Texto colado no programa aberto.", "ok")
             self.aviso.mostrar_mensagem("Colado", "ok", 1500)
+            self.som_do_ditado("atalho", "colado")
             if anterior is not None:
                 self.raiz.after(700, lambda: self.copiar_texto(anterior))
             return
         d.lb_estado.mostrar("✓ Pronto! Texto copiado (Ctrl+V para colar).", "ok")
         self.aviso.mostrar_mensagem("Copiado: Ctrl+V para colar", "ok", 2500)
+        self.som_do_ditado("atalho", "copiado")
 
     def avisar_erro(self, origem, titulo, mensagem, tipo="erro"):
         if origem == "atalho" and not self.janela_visivel():

@@ -1,0 +1,5 @@
+# OPCIONAL: transcrição na placa de vídeo NVIDIA (bem mais rápida que no processador).
+# Instalar depois do requirements.txt:  python -m pip install --user -r requirements-gpu.txt
+# O ctranslate2 já traz o cuDNN; falta só a cuBLAS do CUDA 12 (~500 MB).
+# Testado com uma RTX 2050 (4 GB) e driver 617. Sem GPU, o app usa o processador sozinho.
+nvidia-cublas-cu12==12.9.2.10
